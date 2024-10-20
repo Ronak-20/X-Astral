@@ -8,65 +8,69 @@ const fs = require('fs');
 const path = require('path');
 const { connect } = require("./lib/session");
 const pino = require('pino');
-const {
-	message,
-	updatePresenceStatus
-} = require('./lib');
 
 async function connectBot() {
-	const Microsoft = "./session";
+    const Microsoft = "./session";
     fs.mkdirSync(Microsoft, { recursive: true });
     let sessionId;
     sessionId = await connect();
-    
-	const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
-	const conn = makeWASocket({
-		auth: {
-			creds: state.creds,
-			keys: makeCacheableSignalKeyStore(state.keys, pino({
-				level: "fatal"
-			}).child({
-				level: "fatal"
-			})),
-		},
-		browser: ['Ubuntu', 'Chrome', '20.0.04'],
-		logger: pino({ level: "silent" }),
-		printQRInTerminal: true,
-		markOnlineOnConnect: false
-	});
+async function startWhatsAppBot() {
+    const { state, saveCreds } = await useMultiFileAuthState('./auth_info'); 
 
-	const store = makeInMemoryStore({
-		logger: pino().child({
-			level: 'silent',
-			stream: 'store'
-		})
-	});
-	store.bind(conn.ev);
-	conn.ev.on('connection.update', async (update) => {
-		const { connection } = update;
-		if (connection === "open") {
-			fs.readdirSync("./commands").forEach((plugin) => {
-				if (path.extname(plugin).toLowerCase() === ".js") {
-					import("./commands/" + plugin);
-				}
-			});
-			console.log("_Installed_");
-	 		console.log("Connected to WhatsApp");
-		} else if (connection === "close") {
-			console.log("Connection closed: Reconnecting...");
-				await connectBot();
-			}, 3000);
-		}
-	});
+    const sock = makeWASocket({
+        auth: state,
+        printQRInTerminal: false,  
+    });
 
-	conn.ev.on('messages.upsert', async (m) => {
-		await message(conn, m);
-	});
+    sock.ev.on('connection.update', async (update) => {
+        const { connection, lastDisconnect, qr } = update;
+        if (qr) {
+            qrcode.generate(qr, { small: true });
+        }
 
-	conn.ev.on('creds.update', saveCreds);
+        if (connection === 'close') {
+            const statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode;
+            if (statusCode === DisconnectReason.loggedOut) {
+                console.log(chalk.red('Logged out from WhatsApp. Please scan QR again.'));
+            } else {
+                console.log(chalk.yellow('Reconnecting...'));
+                await startWhatsAppBot();
+            }
+        } else if (connection === 'open') {
+            console.log(chalk.green('Connected to WhatsApp successfully!'));
+        }
+    });
+
+    sock.ev.on('messages.upsert', async (messageUpdate) => {
+        require('./handler/messageHandler')(sock, messageUpdate);  
+    });
+
+    sock.ev.on('group-participants.update', async (update) => {
+        const { id, participants, action } = update;  
+
+        const groupMetadata = await sock.groupMetadata(id); 
+        const groupName = groupMetadata.subject;
+        const currentTime = moment().format('HH:mm'); 
+
+        for (let participant of participants) {
+            const contact = await sock.fetchStatus(participant); 
+
+            if (action === 'add') {
+                
+                const welcomeMessage = `Welcome {X}! You have joined {G} at {T}`.replace('{X}', contact.status || participant).replace('{G}', groupName).replace('{T}', currentTime);
+                await sock.sendMessage(id, { text: welcomeMessage });
+            } else if (action === 'remove') {
+                
+                const goodbyeMessage = `Goodbye {X}! You have left {G} at {T}`.replace('{X}', contact.status || participant).replace('{G}', groupName).replace('{T}', currentTime);
+                await sock.sendMessage(id, { text: goodbyeMessage });
+            }
+        }
+    });
+
+    sock.ev.on('creds.update', saveCreds);
 }
 
+startWhatsAppBot().catch((err) => {
+  });
 
-	await connectBot();
-}, 2000);
-    
+	
